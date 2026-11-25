@@ -1,0 +1,17 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# ./start — arranca el proxy de WhatsApp
+
+cd "$(dirname "$0")"                                      # se mueve a la carpeta del proyecto, la llames desde donde la llames
+
+if [ ! -d node_modules ]; then                            # comprueba si ya se instalaron las dependencias
+  echo "Faltan dependencias: ejecuta primero ./run"; exit 1 # si no, avisa y para
+fi                                                        # fin de la comprobación
+
+command -v termux-wake-lock >/dev/null && termux-wake-lock # evita que Android duerma Termux y corte el proxy con la pantalla apagada
+
+trap 'command -v termux-wake-unlock >/dev/null && termux-wake-unlock' EXIT # al salir (Ctrl+C), libera el bloqueo de suspensión
+
+echo "Abre en el navegador: http://localhost:${PORT:-3000}" # recuerda la dirección de la web local (solo accesible desde este móvil)
+echo "Ctrl+C para detener"                                # cómo pararlo
+
+node index.js                                             # ejecuta el script principal (web local + conexión a WhatsApp)

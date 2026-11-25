@@ -1,0 +1,28 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# ./run — instala todo lo necesario en Termux (solo hace falta una vez)
+
+set -e                                                    # si un paso falla, se detiene aquí (no sigue a medias)
+cd "$(dirname "$0")"                                      # se mueve a la carpeta del proyecto, la llames desde donde la llames
+
+echo "==> Actualizando paquetes de Termux..."             # mensaje informativo
+pkg update -y                                             # actualiza la lista de paquetes disponibles (equivale a apt update)
+pkg upgrade -y -o Dpkg::Options::="--force-confnew"       # actualiza lo ya instalado sin preguntar por archivos de configuración
+
+echo "==> Instalando Node.js (incluye npm)..."            # mensaje informativo
+pkg install -y nodejs-lts                                 # instala Node.js LTS; npm viene incluido
+
+echo "==> Versiones instaladas:"                          # mensaje informativo
+node -v                                                   # muestra la versión de Node (Baileys necesita >= 20)
+npm -v                                                    # muestra la versión de npm
+
+NODE_MAJOR=$(node -p 'process.versions.node.split(".")[0]') # obtiene solo el número principal de la versión de Node
+if [ "$NODE_MAJOR" -lt 20 ]; then                         # comprueba que sea 20 o superior
+  echo "ERROR: se necesita Node 20 o superior"; exit 1    # si no, avisa y para
+fi                                                        # fin de la comprobación
+
+echo "==> Instalando dependencias del proyecto..."        # mensaje informativo
+npm install --no-fund --no-audit                          # instala Baileys, qrcode y pino desde package.json en ./node_modules
+
+chmod +x start                                            # da permiso de ejecución al script ./start
+
+echo "==> Listo. Ejecuta: ./start"                        # indica el siguiente paso

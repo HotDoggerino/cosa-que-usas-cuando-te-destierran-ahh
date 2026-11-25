@@ -1,0 +1,13 @@
+# dependencias (se instalan con ./run o npm install)
+node_modules/
+
+# sesión de WhatsApp: claves privadas, NUNCA subir
+auth/
+
+# configuración local (ids de grupos y usuario)
+state.json
+
+# varios
+*.log
+.env
+.DS_Store
