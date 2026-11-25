@@ -69,6 +69,7 @@ import makeWASocket, {
   fetchLatestBaileysVersion, // única petición fuera de WhatsApp (ver cabecera)
   downloadMediaMessage,      // descarga archivos desde los servidores de WhatsApp
   getContentType,
+  generateMessageIDV2,
   jidNormalizedUser,
   normalizeMessageContent,
 } from '@whiskeysockets/baileys'
@@ -96,9 +97,27 @@ let qrDataUrl = null
 let connected = false
 let me = null
 
-// Ids de mensajes que manda el propio script, para no reenviarlos otra vez
-// (evita bucles A -> X -> A). Solo ids, no contenido; se borran al usarse.
-const sentByBot = new Set()
+// ---------- protección contra bucles ----------
+// Solo se guardan ids (nunca contenido) y caducan a la hora.
+const TTL = 60 * 60 * 1000
+// Ids de mensajes que manda el propio script: nunca se reenvían (evita A -> X -> A).
+// El id se apunta ANTES de enviar, así no hay carrera si WhatsApp nos devuelve
+// el mensaje antes de que termine sendMessage. No se borra al verlo una vez,
+// por si WhatsApp entrega el mismo mensaje dos veces.
+const sentByBot = new Map()
+// Ids de mensajes ya procesados: cada mensaje se reenvía como mucho una vez.
+const seen = new Map()
+const remember = (map, id) => map.set(id, Date.now())
+setInterval(() => {
+  const old = Date.now() - TTL
+  for (const map of [sentByBot, seen]) for (const [id, t] of map) if (t < old) map.delete(id)
+}, 10 * 60 * 1000).unref()
+
+// Fusible: si se reenvían demasiados mensajes en poco tiempo (algo va mal),
+// el proxy se desactiva solo.
+const FUSE_MAX = 20 // mensajes
+const FUSE_WINDOW = 10 * 1000 // en 10 segundos
+let relayTimes = []
 
 // ---------- utilidades ----------
 // Extrae el texto o pie de foto de un mensaje (solo para reenviarlo).
@@ -117,6 +136,24 @@ const MEDIA = ['imageMessage', 'videoMessage', 'ptvMessage', 'audioMessage', 'st
 const senderIds = (key) =>
   [key.participant, key.participantAlt].filter(Boolean).map(jidNormalizedUser)
 
+// Número de teléfono real del remitente (+34600...), si WhatsApp lo da.
+// Con @lid el número no viene en participant; a veces sí en participantAlt.
+const phoneOf = (key) => {
+  const j = senderIds(key).find((x) => x.endsWith('@s.whatsapp.net'))
+  return j ? '+' + j.split('@')[0] : null
+}
+
+// Etiqueta de quién envió un mensaje de A: "Lucia (+34600111222)".
+// El nombre (pushName) lo elige cada uno y se puede repetir o falsear;
+// el número identifica a la persona sin ambigüedad.
+const whoOf = (msg) => {
+  if (msg.key.fromMe) return 'Yo'
+  const name = msg.pushName
+  const phone = phoneOf(msg.key)
+  if (name && phone) return `${name} (${phone})`
+  return name || phone || (msg.key.participant || '?').split('@')[0]
+}
+
 async function start() {
   // La sesión se lee/escribe SOLO en ./auth. No sale de tu equipo.
   const { state: auth, saveCreds } = await useMultiFileAuthState('./auth')
@@ -129,11 +166,25 @@ async function start() {
   // Aparecerá en tu móvil como "Proxy" en Dispositivos vinculados.
   const sock = makeWASocket({ auth, version, logger, browser: ['Proxy', 'Chrome', '1.0'] })
 
-  // Envía un mensaje por WhatsApp y apunta su id para no reenviarlo en bucle.
-  const send = async (jid, content, opts) => {
-    const r = await sock.sendMessage(jid, content, opts)
-    if (r?.key?.id) sentByBot.add(r.key.id)
-    return r
+  // Envía un mensaje por WhatsApp. El id se genera y se apunta ANTES de enviar
+  // para que, si vuelve como mensaje entrante, se ignore seguro (sin bucles).
+  const send = (jid, content, opts = {}) => {
+    const messageId = opts.messageId || generateMessageIDV2(sock.user?.id)
+    remember(sentByBot, messageId)
+    return sock.sendMessage(jid, content, { ...opts, messageId })
+  }
+
+  // Cuenta los reenvíos; si se dispara el fusible, desactiva el proxy.
+  const fuseBlown = async () => {
+    const now = Date.now()
+    relayTimes = relayTimes.filter((t) => now - t < FUSE_WINDOW)
+    relayTimes.push(now)
+    if (relayTimes.length <= FUSE_MAX) return false
+    state.active = false
+    save()
+    relayTimes = []
+    if (state.proxy) await send(state.proxy, { text: `⚠️ Más de ${FUSE_MAX} mensajes en ${FUSE_WINDOW / 1000}s: proxy desactivado por seguridad. Usa /invoke en A para reactivarlo.` })
+    return true
   }
   const reply = (msg, text) => send(msg.key.remoteJid, { text }, { quoted: msg })
 
@@ -243,7 +294,9 @@ async function start() {
     const m = normalizeMessageContent(msg.message)
     // Solo grupos. Los chats privados se ignoran siempre: nunca se leen ni reenvían.
     if (!m || !jid?.endsWith('@g.us')) return
-    if (sentByBot.has(msg.key.id)) return sentByBot.delete(msg.key.id)
+    // Mensajes enviados por el propio script o ya procesados: nunca se reenvían.
+    if (sentByBot.has(msg.key.id) || seen.has(msg.key.id)) return
+    remember(seen, msg.key.id)
 
     const text = textOf(m).trim()
 
@@ -258,6 +311,9 @@ async function start() {
         const digits = args.join('').replace(/\D/g, '')
         if (!user && digits) user = `${digits}@s.whatsapp.net`
         if (!user) return reply(msg, 'Uso: /select @usuario [apodo]  (o número, o respondiendo a un mensaje suyo)')
+        // Elegirte a ti mismo haría que tus propios reenvíos pudieran volver a A.
+        const mine = [me?.id, me?.lid].filter(Boolean).map(jidNormalizedUser)
+        if (mine.includes(jidNormalizedUser(user))) return reply(msg, '❌ No puedes seleccionarte a ti mismo.')
         // apodo opcional: lo que no sea @mención ni número
         const nick = args.filter((a) => !a.startsWith('@') && !/^\+?\d+$/.test(a)).join(' ') || null
         state = { proxy: jid, user: jidNormalizedUser(user), nick, fixedNick: !!nick, target: null, active: false }
@@ -300,10 +356,14 @@ async function start() {
     // Si el proxy no está activo, no se reenvía absolutamente nada.
     if (!state.active) return
 
+    // Nunca reenviar entre el mismo grupo (A y X deben ser distintos).
+    if (state.target === state.proxy) return
+    const relevant = jid === state.target || (jid === state.proxy && senderIds(msg.key).includes(state.user))
+    if (relevant && (await fuseBlown())) return
+
     // ----- A -> X : se copia todo lo del grupo A al grupo proxy -----
     if (jid === state.target) {
-      const who = msg.key.fromMe ? 'Yo' : msg.pushName || (msg.key.participant || '').split('@')[0]
-      return relay(msg, state.proxy, who)
+      return relay(msg, state.proxy, whoOf(msg))
     }
 
     // ----- X -> A : solo el usuario seleccionado, con su apodo delante -----
